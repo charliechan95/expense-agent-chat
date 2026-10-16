@@ -40,6 +40,13 @@
   #input { flex: 1; font-size: 15px; padding: 10px 12px; border-radius: 8px;
            border: 1px solid var(--line); }
   .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  #auth-block { margin: 10px 0 4px; font-size: 14px; }
+  #auth-block input { font-size: 14px; padding: 8px 10px; border-radius: 8px;
+                      border: 1px solid var(--line); margin: 0 6px 6px 0;
+                      max-width: 220px; }
+  #auth-block code { background: #f0ead9; padding: 1px 5px; border-radius: 4px;
+                     font-size: 12px; }
+  #auth-signedin { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -47,6 +54,23 @@
   <header>
     <h1>Expense Agent — chat demo</h1>
     <div class="status" id="status">Connecting…</div>
+    <div id="auth-block">
+      <div id="auth-signedout">
+        <input id="auth-email" type="email" autocomplete="email"
+               placeholder="Email — same account as the Expense Tracker">
+        <input id="auth-password" type="password" autocomplete="current-password"
+               placeholder="Password">
+        <button id="auth-signin" class="primary">Sign in</button>
+        <div class="note">Sign in with the same account you use in the Expense Tracker
+          app — the agent then reads and writes your real expenses.
+          唔登入就繼續用示範資料。</div>
+      </div>
+      <div id="auth-signedin" hidden>
+        <span>Signed in as <code id="auth-user-email"></code> — the agent is now
+          using your Expense Tracker data. （已登入 — 助理會使用你的記帳資料。）</span>
+        <button id="auth-signout">Sign out</button>
+      </div>
+    </div>
   </header>
   <div id="transcript" aria-live="polite"></div>
 </div>
@@ -63,11 +87,68 @@
 "use strict";
 // Hosted version: the API base comes from config.js (set after deployment).
 const API = String(window.AGENT_API || "").replace(/\/+$/, "");
+const SUPABASE_URL = String(window.SUPABASE_URL || "").replace(/\/+$/, "");
+const PUBKEY = String(window.SUPABASE_PUBLISHABLE_KEY || "");
 const transcript = document.getElementById("transcript");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const statusEl = document.getElementById("status");
 let busy = false;
+
+// ---- Sign-in ------------------------------------------------------------
+// Same Supabase project and account as the Expense Tracker app (password
+// grant with the publishable key, like the app's own sign-in). The access
+// token is kept in sessionStorage (cleared when the tab closes); it goes
+// out as Authorization: Bearer on /agent and /agent/confirm so the function
+// can scope everything to this user's real Expense Tracker data.
+// Signed out = demo mode, exactly as before.
+const SESSION_KEY = "expense_agent_chat_session";
+
+function getSession() {
+  try {
+    const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+    return s && s.access_token ? s : null;
+  } catch { return null; }
+}
+function saveSession(s) { sessionStorage.setItem(SESSION_KEY, JSON.stringify(s)); }
+function clearSession() { sessionStorage.removeItem(SESSION_KEY); }
+
+function authHeader() {
+  const s = getSession();
+  return s ? { "Authorization": "Bearer " + s.access_token } : {};
+}
+
+// Called whenever the server says the token is no good (or sign-out):
+// drop the session and send the user back to the sign-in form.
+function handleAuthExpired() {
+  clearSession();
+  refreshAuthUI();
+  addMessage("Your sign-in expired — please sign in again. 登入已過期，請重新登入。", "agent");
+}
+
+function refreshAuthUI() {
+  const s = getSession();
+  document.getElementById("auth-signedout").hidden = !!s;
+  document.getElementById("auth-signedin").hidden = !s;
+  if (s) document.getElementById("auth-user-email").textContent = s.email || "";
+  updateStatusLine();
+}
+
+function updateStatusLine() {
+  const s = getSession();
+  fetch(API + "/agent/status").then(r => r.json()).then(st => {
+    const model = "<code>" + esc(st.primary || "unknown") + "</code>";
+    if (s) {
+      statusEl.innerHTML = "Signed in as <code>" + esc(s.email || "") +
+        "</code> — using your Expense Tracker data. Primary model: " + model;
+    } else {
+      statusEl.innerHTML = "Primary model: " + model +
+        " · Demo on mock data — reads are instant, writes need your confirm.";
+    }
+  }).catch(() => {
+    statusEl.textContent = "Status unavailable — is the server running?";
+  });
+}
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c =>
@@ -83,18 +164,14 @@ function addMessage(text, kind) {
   return div;
 }
 
-// On load: show which model is currently primary (live from the server).
-fetch(API + "/agent/status").then(r => r.json()).then(s => {
-  statusEl.innerHTML = "Primary model: <code>" + esc(s.primary || "unknown") +
-    "</code> · Demo on mock data — reads are instant, writes need your confirm.";
-}).catch(() => {
-  statusEl.textContent = "Status unavailable — is the server running?";
-});
+// On load: show which model is currently primary (live from the server)
+// plus whether the agent is on demo data or the signed-in user's data.
+updateStatusLine();
 
 async function postJSON(url, payload) {
   const r = await fetch(url, {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: Object.assign({"Content-Type": "application/json"}, authHeader()),
     body: JSON.stringify(payload),
   });
   const data = await r.json().catch(() => ({}));
@@ -118,7 +195,9 @@ function addProposalCard(agentMsgEl, pendingId) {
     confirmBtn.disabled = dismissBtn.disabled = true;
     try {
       const res = await postJSON(API + "/agent/confirm", {action_id: pendingId});
-      if (res.status === "ok" && res.record) {
+      if (res.auth_expired) {
+        handleAuthExpired();
+      } else if (res.status === "ok" && res.record) {
         addMessage("Confirmed — recorded: " + res.record.description +
           ", $" + res.record.amount + " · " + res.record.category +
           " · " + res.record.date + " (id " + res.record.id + ")", "agent");
@@ -147,6 +226,11 @@ async function send() {
   try {
     const res = await postJSON(API + "/agent", {text});
     thinking.remove();
+    if (res.auth_expired) {
+      handleAuthExpired();
+      busy = false; sendBtn.disabled = false; input.focus();
+      return;
+    }
     const agentEl = addMessage(res.answer || "(no answer)", "agent");
     if (res.calls && res.calls.length) {
       const t = document.createElement("div");
@@ -166,8 +250,67 @@ async function send() {
 
 sendBtn.addEventListener("click", send);
 input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
-addMessage("Hi — ask me about the demo expenses (in English or 中文）, or tell me to record one. " +
-  "Any new expense stays a proposal until you tap Confirm.", "agent");
+
+async function doSignIn() {
+  const email = document.getElementById("auth-email").value.trim();
+  const password = document.getElementById("auth-password").value;
+  if (!email || !password) {
+    addMessage("Enter your email and password first. 請先輸入電郵同密碼。", "agent");
+    return;
+  }
+  const btn = document.getElementById("auth-signin");
+  btn.disabled = true;
+  try {
+    const r = await fetch(SUPABASE_URL + "/auth/v1/token?grant_type=password", {
+      method: "POST",
+      headers: { "apikey": PUBKEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error_description || data.msg || "Sign-in failed");
+    saveSession({
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      email: (data.user && data.user.email) || email,
+      user_id: data.user && data.user.id,
+      expires_at: data.expires_at,
+    });
+    document.getElementById("auth-password").value = "";
+    refreshAuthUI();
+    addMessage("Signed in as " + email + " — ask me about YOUR expenses now. " +
+      "已登入 — 而家可以直接問你嘅記帳。Any new expense still stays a proposal until you tap Confirm.", "agent");
+  } catch (e) {
+    addMessage("Sign-in failed: " + e.message, "agent");
+  }
+  btn.disabled = false;
+}
+
+async function doSignOut() {
+  // Best-effort server-side logout; the local session is dropped regardless.
+  const s = getSession();
+  try {
+    if (s) {
+      await fetch(SUPABASE_URL + "/auth/v1/logout", {
+        method: "POST",
+        headers: { "apikey": PUBKEY, "Authorization": "Bearer " + s.access_token },
+      });
+    }
+  } catch { /* local session is dropped regardless */ }
+  clearSession();
+  refreshAuthUI();
+  addMessage("Signed out — the agent is back on demo data. 已登出 — 助理返返去示範模式。", "agent");
+}
+
+document.getElementById("auth-signin").addEventListener("click", doSignIn);
+document.getElementById("auth-password").addEventListener("keydown",
+  e => { if (e.key === "Enter") doSignIn(); });
+document.getElementById("auth-signout").addEventListener("click", doSignOut);
+
+refreshAuthUI();
+if (!getSession()) {
+  addMessage("Hi — ask me about the demo expenses (in English or 中文）, or tell me to record one. " +
+    "Any new expense stays a proposal until you tap Confirm.", "agent");
+}
 input.focus();
 </script>
 </body>
