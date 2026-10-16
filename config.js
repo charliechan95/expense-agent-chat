@@ -7,7 +7,7 @@
  * The three chat calls become:
  *   {base}/agent/status, {base}/agent, {base}/agent/confirm
  */
-window.AGENT_API = "https://YOUR_PROJECT_REF.supabase.co/functions/v1";
+window.AGENT_API = "https://cgbtthjtnznedyxwtmuo.supabase.co/functions/v1";
 
 /* Sign-in for the chat page: the SAME Supabase project and the SAME
  * account as the Expense Tracker app (see expense-tracker/config.js).
