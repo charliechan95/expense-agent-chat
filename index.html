@@ -37,6 +37,8 @@
   #composer { position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg);
               border-top: 1px solid var(--line); padding: 10px 14px; }
   #composer .wrap { display: flex; gap: 8px; padding: 0; margin: 0 auto; max-width: 720px; }
+  #attach-chip { display: none; font-size: 13px; color: var(--muted); padding: 6px 2px 0; }
+  #attach-chip button { font-size: 12px; padding: 2px 8px; margin-left: 8px; }
   #input { flex: 1; font-size: 15px; padding: 10px 12px; border-radius: 8px;
            border: 1px solid var(--line); }
   .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
@@ -76,13 +78,82 @@
 </div>
 <div id="composer">
   <div class="wrap">
+    <button id="attach" title="Attach a PDF — a statement or document for the agent to read">📎 PDF</button>
+    <input id="pdf-file" type="file" accept=".pdf" hidden>
     <input id="input" type="text" autocomplete="off" enterkeyhint="send"
            placeholder="Ask about spending, e.g. How much did I spend on Transport in 2026-10?">
     <button id="send" class="primary">Send</button>
   </div>
+  <div class="wrap"><div id="attach-chip"></div></div>
 </div>
 
 <script src="config.js"></script>
+<script>
+/*PDFPARSER-START*/
+/* AlipayHK Transaction Statement parser — ported from the Expense
+   Tracker importer (same grammar, same header-row + watermark rules).
+   Pure over pdf.js positioned items: [{str, x, y}] per page. */
+function parseAlipayHkItems(pages) {
+  const MONTHS = { Jan: "01", Feb: "02", Mar: "03", Apr: "04", May: "05", Jun: "06", Jul: "07", Aug: "08", Sep: "09", Oct: "10", Nov: "11", Dec: "12" };
+
+    const all = [];
+    (pages || []).forEach((items) => (items || []).forEach((it) => all.push(it.str || "")));
+    const joined = all.join(" ");
+    if (!joined.includes("Transaction Statement") || !joined.includes("ALIPAY FINANCIAL SERVICES (HK)")) return null;
+    let bands = null;
+    for (const items of pages || []) {
+      // The header is a ROW: all five labels share one y level. (The
+      // summary block also prints "Transaction Type" as a lone label —
+      // matching labels independently would pick that one and break
+      // every band.)
+      for (const d of items || []) {
+        if (!(d.str || "").trim().startsWith("Transaction Date")) continue;
+        const row = (items || []).filter((it) => Math.abs(it.y - d.y) <= 2);
+        const at = (label) => row.find((it) => (it.str || "").trim().startsWith(label));
+        const n = at("Transaction Number"), ty = at("Transaction Type"),
+              m = at("Recipient / Merchant"), a = at("Transaction Amount");
+        if (n && ty && m && a) { bands = { d: d.x, n: n.x, ty: ty.x, m: m.x, a: a.x, y: d.y }; break; }
+      }
+      if (bands) break;
+    }
+    if (!bands) return null;
+    const bandOf = (x) => x < bands.n ? "date" : x < bands.ty ? "num" : x < bands.m ? "type" : x < bands.a ? "merchant" : "amount";
+    const dateRe = /^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})$/;
+    const out = [];
+    for (const items of pages || []) {
+      const starts = (items || []).filter((it) => it.y < bands.y - 2 && bandOf(it.x) === "date" && dateRe.test((it.str || "").trim()));
+      for (const st of starts) {
+        const dm = (st.str || "").trim().match(dateRe);
+        const rowItems = (items || []).filter((it) => it !== st && it.y <= st.y + 2 && it.y >= st.y - 16);
+        const by = { num: [], type: [], merchant: [], amount: [] };
+        for (const it of rowItems) {
+          const b = bandOf(it.x);
+          if (b in by) by[b].push(it);
+        }
+        const txm = by.num.map((i) => i.str).join(" ").match(/\d{16,}/);
+        if (!txm) continue;
+        const amtText = by.amount.sort((p, q) => p.x - q.x).map((i) => i.str).join(" ");
+        const am = amtText.match(/([+\-])?\s*(HKD|CNY|USD|EUR|GBP|JPY|MOP)?\s*([\d,]+\.\d{2})/);
+        if (!am) continue;
+        const signed = (am[1] === "+" ? 1 : -1) * parseFloat(am[3].replace(/,/g, ""));
+        if (!(signed < 0)) continue; // money in / zero: not an expense row
+        const merchant = by.merchant.sort((p, q) => p.x - q.x).map((i) => (i.str || "").trim())
+          .filter((x) => x && x !== "Confidential" && x !== "保密").join(" ").trim();
+        const type = by.type.map((i) => (i.str || "").trim()).filter(Boolean).join(" ");
+        out.push({
+          amount: Math.abs(signed), currency: am[2] || "HKD", category: "Other", platform: "alipay",
+          merchant, description: merchant,
+          expense_date: dm[3] + "-" + MONTHS[dm[2]] + "-" + dm[1].padStart(2, "0"),
+          external_id: "alipayhk:" + txm[0], source: "alipayhk_pdf",
+          txtype: type,
+        });
+      }
+    }
+    return { platform: "alipay", expenses: out };
+  
+}
+/*PDFPARSER-END*/
+</script>
 <script>
 "use strict";
 // Hosted version: the API base comes from config.js (set after deployment).
@@ -217,14 +288,18 @@ function addProposalCard(agentMsgEl, pendingId) {
 }
 
 async function send() {
-  const text = input.value.trim();
+  const att = pendingAttachment;
+  const text = input.value.trim() || (att ? "Please read and analyse the attached document." : "");
   if (!text || busy) return;
   busy = true; sendBtn.disabled = true;
   input.value = "";
-  addMessage(text, "user");
+  if (att) { pendingAttachment = null; renderAttachChip(); }
+  addMessage(text + (att ? "\n📄 " + att.filename : ""), "user");
   const thinking = addMessage("thinking…", "thinking");
   try {
-    const res = await postJSON(API + "/agent", {text});
+    const payload = {text};
+    if (att) payload.attachment = att;
+    const res = await postJSON(API + "/agent", payload);
     thinking.remove();
     if (res.auth_expired) {
       handleAuthExpired();
@@ -247,6 +322,83 @@ async function send() {
   }
   busy = false; sendBtn.disabled = false; input.focus();
 }
+
+/* ---- PDF attach: read on this device, never uploaded as a file ----
+   pdf.js is lazy-loaded (pinned) only when a PDF is picked. AlipayHK
+   statements are parsed into rows on-device; any other PDF is sent as
+   extracted text. The agent's computed totals are made server-side. */
+let pendingAttachment = null;
+
+async function ensurePdfJs() {
+  if (window.__pdfjsLib && window.__pdfjsLib.getDocument) return window.__pdfjsLib;
+  const lib = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/build/pdf.min.mjs");
+  lib.GlobalWorkerOptions.workerSrc =
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/build/pdf.worker.min.mjs";
+  // Without the CMap pack, pdf.js silently drops CJK glyphs (Chinese
+  // merchant names would vanish). Pinned, same version.
+  window.__pdfjsOptions = {
+    cMapUrl: "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/cmaps/",
+    cMapPacked: true,
+    standardFontDataUrl: "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/standard_fonts/",
+  };
+  window.__pdfjsLib = lib;
+  return lib;
+}
+
+function renderAttachChip() {
+  const chip = document.getElementById("attach-chip");
+  if (!pendingAttachment) { chip.style.display = "none"; chip.innerHTML = ""; return; }
+  chip.style.display = "block";
+  chip.textContent = "📄 " + pendingAttachment.filename + " — " + (pendingAttachment._summary || "ready");
+  const x = document.createElement("button");
+  x.textContent = "✕ Remove";
+  x.addEventListener("click", () => { pendingAttachment = null; renderAttachChip(); });
+  chip.appendChild(x);
+}
+
+async function readPdfFile(file) {
+  const lib = await ensurePdfJs();
+  const buf = await file.arrayBuffer();
+  const pdf = await lib.getDocument(Object.assign({}, window.__pdfjsOptions || {}, { data: new Uint8Array(buf) })).promise;
+  const pages = [];
+  let textAll = "";
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    const items = (tc.items || []).map(it => ({ str: it.str, x: it.transform[4], y: it.transform[5] }));
+    pages.push(items);
+    textAll += items.map(i => i.str).join(" ") + "\n";
+  }
+  const stmt = parseAlipayHkItems(pages);
+  if (stmt && stmt.expenses.length) {
+    const rows = stmt.expenses.map(r => ({ date: r.expense_date, merchant: r.merchant, amount: r.amount, currency: r.currency, type: r.txtype || "" }));
+    const total = rows.reduce((a, r) => a + r.amount, 0);
+    return { kind: "alipayhk_statement", filename: file.name, rows,
+             _summary: rows.length + " transactions · " + rows[0].currency + " " + total.toFixed(2) };
+  }
+  return { kind: "pdf_text", filename: file.name, text: textAll.slice(0, 8000),
+           _summary: "document text (" + pdf.numPages + " page" + (pdf.numPages > 1 ? "s" : "") + ")" };
+}
+
+const attachBtn = document.getElementById("attach");
+const pdfFileInput = document.getElementById("pdf-file");
+attachBtn.addEventListener("click", () => pdfFileInput.click());
+pdfFileInput.addEventListener("change", async () => {
+  const file = pdfFileInput.files[0];
+  pdfFileInput.value = "";
+  if (!file) return;
+  const chip = document.getElementById("attach-chip");
+  chip.style.display = "block";
+  chip.textContent = "Reading " + file.name + " on this device…";
+  try {
+    pendingAttachment = await readPdfFile(file);
+    renderAttachChip();
+  } catch (e) {
+    pendingAttachment = null;
+    renderAttachChip();
+    addMessage("Could not read that PDF: " + e.message, "agent");
+  }
+});
 
 sendBtn.addEventListener("click", send);
 input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
