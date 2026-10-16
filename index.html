@@ -331,9 +331,12 @@ let pendingAttachment = null;
 
 async function ensurePdfJs() {
   if (window.__pdfjsLib && window.__pdfjsLib.getDocument) return window.__pdfjsLib;
-  const lib = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/build/pdf.min.mjs");
+  const lib = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/legacy/build/pdf.min.mjs");
   lib.GlobalWorkerOptions.workerSrc =
-    "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/build/pdf.worker.min.mjs";
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/legacy/build/pdf.worker.min.mjs";
+  // LEGACY build on purpose (same pinned version): the modern build needs
+  // Promise.withResolvers, missing on older mobile browsers — the app
+  // loader carries the full note. CMaps below unchanged.
   // Without the CMap pack, pdf.js silently drops CJK glyphs — Chinese
   // merchant names on statements would vanish. The maps ship WITH the
   // page (cmaps/ folder, from the same pinned pdfjs-dist package) and
