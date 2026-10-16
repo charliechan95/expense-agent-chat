@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Expense Agent — Chat (demo)</title>
+<style>
+  :root { --bg: #f7f5f0; --ink: #1c1a17; --muted: #6b675f; --card: #fffdf9;
+          --line: #ddd6c9; --green: #177245; --accent: #8a5a2b; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+         background: var(--bg); color: var(--ink); margin: 0; line-height: 1.5; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 16px 14px 90px; }
+  header { margin: 8px 0 14px; }
+  header h1 { font-size: 20px; margin: 0 0 4px; }
+  .status { font-size: 13px; color: var(--muted); }
+  .status code { background: #f0ead9; padding: 1px 5px; border-radius: 4px;
+                 font-size: 12px; word-break: break-all; }
+  #transcript { display: flex; flex-direction: column; gap: 10px; }
+  .msg { background: var(--card); border: 1px solid var(--line);
+         border-radius: 12px; padding: 10px 14px; white-space: pre-wrap;
+         word-wrap: break-word; font-size: 15px; }
+  .msg.user { align-self: flex-end; background: #1c1a17; color: #fffdf9;
+              border-color: #1c1a17; max-width: 85%; }
+  .msg.agent { align-self: flex-start; max-width: 92%; }
+  .msg.thinking { color: var(--muted); font-style: italic; }
+  .tools { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .proposal { margin-top: 10px; border: 1px dashed var(--accent); border-radius: 10px;
+              padding: 10px 12px; background: #fbf6ea; }
+  .proposal p { margin: 0 0 8px; font-size: 14px; }
+  .proposal .pid { font-family: monospace; font-size: 12px; color: var(--muted); }
+  .row { display: flex; gap: 8px; }
+  button { font-size: 14px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line);
+           background: #fff; cursor: pointer; }
+  button.primary { background: var(--green); border-color: var(--green); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #composer { position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg);
+              border-top: 1px solid var(--line); padding: 10px 14px; }
+  #composer .wrap { display: flex; gap: 8px; padding: 0; margin: 0 auto; max-width: 720px; }
+  #input { flex: 1; font-size: 15px; padding: 10px 12px; border-radius: 8px;
+           border: 1px solid var(--line); }
+  .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Expense Agent — chat demo</h1>
+    <div class="status" id="status">Connecting…</div>
+  </header>
+  <div id="transcript" aria-live="polite"></div>
+</div>
+<div id="composer">
+  <div class="wrap">
+    <input id="input" type="text" autocomplete="off" enterkeyhint="send"
+           placeholder="Ask about spending, e.g. How much did I spend on Transport in 2026-10?">
+    <button id="send" class="primary">Send</button>
+  </div>
+</div>
+
+<script src="config.js"></script>
+<script>
+"use strict";
+// Hosted version: the API base comes from config.js (set after deployment).
+const API = String(window.AGENT_API || "").replace(/\/+$/, "");
+const transcript = document.getElementById("transcript");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const statusEl = document.getElementById("status");
+let busy = false;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function addMessage(text, kind) {
+  const div = document.createElement("div");
+  div.className = "msg " + kind;
+  div.innerHTML = esc(text).replace(/\n/g, "<br>");
+  transcript.appendChild(div);
+  div.scrollIntoView({behavior: "smooth", block: "end"});
+  return div;
+}
+
+// On load: show which model is currently primary (live from the server).
+fetch(API + "/agent/status").then(r => r.json()).then(s => {
+  statusEl.innerHTML = "Primary model: <code>" + esc(s.primary || "unknown") +
+    "</code> · Demo on mock data — reads are instant, writes need your confirm.";
+}).catch(() => {
+  statusEl.textContent = "Status unavailable — is the server running?";
+});
+
+async function postJSON(url, payload) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+// A pending proposal is ONLY executed when the human taps Confirm.
+// Dismiss just hides the card; the agent never saves it.
+function addProposalCard(agentMsgEl, pendingId) {
+  const card = document.createElement("div");
+  card.className = "proposal";
+  card.innerHTML =
+    "<p><strong>Pending proposal</strong> <span class='pid'>" + esc(pendingId) +
+    "</span><br>This expense is <strong>not saved yet</strong>. Confirm to record it, " +
+    "or dismiss to leave your data untouched.</p>" +
+    "<div class='row'><button class='primary'>Confirm</button>" +
+    "<button>Dismiss</button></div>";
+  const [confirmBtn, dismissBtn] = card.querySelectorAll("button");
+  confirmBtn.addEventListener("click", async () => {
+    confirmBtn.disabled = dismissBtn.disabled = true;
+    try {
+      const res = await postJSON(API + "/agent/confirm", {action_id: pendingId});
+      if (res.status === "ok" && res.record) {
+        addMessage("Confirmed — recorded: " + res.record.description +
+          ", $" + res.record.amount + " · " + res.record.category +
+          " · " + res.record.date + " (id " + res.record.id + ")", "agent");
+      } else {
+        addMessage("Could not confirm: " + (res.reason || res.status), "agent");
+      }
+    } catch (e) {
+      addMessage("Confirm failed: " + e.message, "agent");
+    }
+    card.remove();
+  });
+  dismissBtn.addEventListener("click", () => {
+    addMessage("Dismissed — the proposal was not saved.", "agent");
+    card.remove();
+  });
+  agentMsgEl.appendChild(card);
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || busy) return;
+  busy = true; sendBtn.disabled = true;
+  input.value = "";
+  addMessage(text, "user");
+  const thinking = addMessage("thinking…", "thinking");
+  try {
+    const res = await postJSON(API + "/agent", {text});
+    thinking.remove();
+    const agentEl = addMessage(res.answer || "(no answer)", "agent");
+    if (res.calls && res.calls.length) {
+      const t = document.createElement("div");
+      t.className = "tools";
+      t.textContent = "tools: " + res.calls.map(c =>
+        (c.tool || "?") + " → " + (c.outcome || "?")).join(", ");
+      agentEl.appendChild(t);
+    }
+    (res.pending_ids || []).forEach(id => addProposalCard(agentEl, id));
+    if (res.failed) addMessage("The agent could not complete that request.", "agent");
+  } catch (e) {
+    thinking.remove();
+    addMessage("Error: " + e.message, "agent");
+  }
+  busy = false; sendBtn.disabled = false; input.focus();
+}
+
+sendBtn.addEventListener("click", send);
+input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
+addMessage("Hi — ask me about the demo expenses (in English or 中文）, or tell me to record one. " +
+  "Any new expense stays a proposal until you tap Confirm.", "agent");
+input.focus();
+</script>
+</body>
+</html>
